@@ -1,0 +1,10 @@
+config.py
+positions.json
+hold_positions.json
+seen_mints.json
+seen_mints.json.bak
+pending_mints.json
+score_log.json
+__pycache__/
+venv/
+*.pyc
