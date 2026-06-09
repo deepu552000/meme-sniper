@@ -8,3 +8,4 @@ score_log.json
 __pycache__/
 venv/
 *.pyc
+score_log_backup*.json
