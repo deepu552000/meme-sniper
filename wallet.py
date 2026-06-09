@@ -47,7 +47,8 @@ def get_token_balance(mint: str) -> float:
         resp = client.get_token_accounts_by_owner(
             pubkey,
             {"mint": mint_pk},
-            {"encoding": "jsonParsed"}
+            {"encoding": "jsonParsed"},
+            commitment="confirmed",
         )
         accounts = resp.value
         if not accounts:

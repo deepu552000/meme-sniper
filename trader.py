@@ -82,7 +82,24 @@ def buy_token(mint: str, usd_amount: float = None) -> dict:
 
     tx_hash = _sign_and_send(swap_tx)
     if not tx_hash:
-        return {"success": False, "tx": "", "amount_out": 0, "error": "TX send failed"}
+        # Check if it was an AmountIsZero error — quote was stale, retry once with fresh quote
+        # This happens when price moves between quote fetch and swap execution
+        print(f"[trader] TX failed — retrying once with fresh quote (AmountIsZero guard)...")
+        import time as _t; _t.sleep(2)
+        quote = _get_quote(
+            input_mint=config.SOL_MINT,
+            output_mint=mint,
+            amount=lamports,
+            slippage_bps=config.SLIPPAGE_BPS
+        )
+        if not quote:
+            return {"success": False, "tx": "", "amount_out": 0, "error": "TX send failed + retry quote failed"}
+        swap_tx = _get_swap_tx(quote, pubkey)
+        if not swap_tx:
+            return {"success": False, "tx": "", "amount_out": 0, "error": "TX send failed + retry swap TX failed"}
+        tx_hash = _sign_and_send(swap_tx)
+        if not tx_hash:
+            return {"success": False, "tx": "", "amount_out": 0, "error": "TX send failed after retry"}
 
     amount_out = int(quote.get("outAmount", 0))
     return {"success": True, "tx": tx_hash, "amount_out": amount_out, "error": ""}
@@ -112,7 +129,16 @@ def sell_token(mint: str, amount: float | None = None) -> dict:
         result = _sell_pump_fun(mint, amount)
         if result["success"]:
             return result
+        # Pass the fee-adjusted amount to Jupiter so it doesn't try to sell
+        # more tokens than the wallet actually has after transfer fees
+        jupiter_amount = amount * 0.94 if amount is not None else None
         print(f"[trader] PumpPortal failed ({result['error']}) — falling back to Jupiter...")
+        result = _sell_jupiter(mint, jupiter_amount)
+
+        if not result["success"]:
+            _fire_sell_failed(mint, result["error"])
+
+        return result
 
     result = _sell_jupiter(mint, amount)
 
@@ -205,11 +231,24 @@ def _sell_pump_fun(mint: str, amount: float | None = None) -> dict:
     print(f"[trader] Token graduated → PumpPortal pool={pool}")
 
     try:
-        # Token-2022 transfer fee workaround — reduce amount by 1% so the
-        # transfer fee deduction doesn't cause 'insufficient funds' on-chain
-        amount = amount * 0.99
+        # Always fetch a fresh on-chain balance right before building the tx.
+        # The passed-in amount may be stale (fetched earlier by the monitor),
+        # and using a stale value causes insufficient funds if tokens were
+        # partially moved or fees accrued since the last balance check.
+        fresh_balance = w.get_token_balance(mint)
+        if fresh_balance > 0 and abs(fresh_balance - amount) / max(amount, 1) > 0.001:
+            print(f"[trader] Balance refreshed: {amount:.4f} → {fresh_balance:.4f} tokens")
+        amount = fresh_balance if fresh_balance > 0 else amount
 
-        print(f"[trader] PumpPortal sell: {amount:.4f} tokens of {mint}...")
+        if amount <= 0:
+            return {"success": False, "tx": "", "sol_received": 0, "error": "Zero balance after refresh"}
+
+        # Token-2022 transfer fee workaround — reduce amount by 6% so the
+        # transfer fee deduction doesn't cause 'insufficient funds' on-chain.
+        # pump.fun Token-2022 tokens can have fees up to ~5%; 6% gives safe margin.
+        adjusted_amount = amount * 0.94
+
+        print(f"[trader] PumpPortal sell: {adjusted_amount:.4f} tokens of {mint} (fee-adjusted from {amount:.4f})...")
 
         response = requests.post(
             url="https://pumpportal.fun/api/trade-local",
@@ -217,7 +256,7 @@ def _sell_pump_fun(mint: str, amount: float | None = None) -> dict:
                 "publicKey":        pubkey,
                 "action":           "sell",
                 "mint":             mint,
-                "amount":           amount,
+                "amount":           adjusted_amount,
                 "denominatedInSol": "false",
                 "slippage":         25,
                 "priorityFee":      0.00005,
@@ -296,8 +335,15 @@ def _sell_jupiter(mint: str, amount: float | None = None) -> dict:
     """
     pubkey = w.get_pubkey()
 
-    if amount is None:
-        amount = w.get_token_balance(mint)
+    # Always fetch a fresh on-chain balance — stale amounts from the monitor
+    # can be higher than the actual wallet balance, causing insufficient funds.
+    fresh_balance = w.get_token_balance(mint)
+    if amount is not None and fresh_balance > 0 and abs(fresh_balance - amount) / max(amount, 1) > 0.001:
+        print(f"[trader] Jupiter balance refreshed: {amount:.4f} → {fresh_balance:.4f} tokens")
+    if fresh_balance > 0:
+        amount = fresh_balance
+    elif amount is None:
+        amount = 0
 
     if amount <= 0:
         return {"success": False, "tx": "", "sol_received": 0, "error": "Zero balance"}
@@ -375,6 +421,26 @@ def _sell_jupiter(mint: str, amount: float | None = None) -> dict:
         return {"success": True, "tx": tx_hash, "sol_received": sol_out, "error": ""}
 
     print(f"[trader] Jupiter sell FAILED after {len(slippage_ladder)} attempts: {last_error}")
+
+    # Last resort for Token-2022: retry at max slippage WITHOUT onlyDirectRoutes.
+    # The 0x1788 error on all attempts usually means Jupiter can't find a direct
+    # route for a freshly-graduated token — relaxing the route restriction often fixes it.
+    if is_token_2022:
+        print(f"[trader] Token-2022 last resort: retrying at 90% slippage without route restriction...")
+        time.sleep(2)
+        quote = _get_quote(mint, config.SOL_MINT, amount_raw, 9000, only_direct_routes=False)
+        if quote:
+            route_labels = [s["swapInfo"]["label"] for s in quote.get("routePlan", [])]
+            print(f"[trader] Jupiter last-resort route: {route_labels}")
+            swap_tx = _get_swap_tx(quote, pubkey)
+            if swap_tx:
+                tx_hash = _sign_and_send(swap_tx)
+                if tx_hash:
+                    sol_out = int(quote.get("outAmount", 0)) / 1_000_000_000
+                    print(f"[trader] Jupiter last-resort sell succeeded!")
+                    return {"success": True, "tx": tx_hash, "sol_received": sol_out, "error": ""}
+        print(f"[trader] Jupiter last-resort also failed.")
+
     return {"success": False, "tx": "", "sol_received": 0, "error": f"All retries failed: {last_error}"}
 
 

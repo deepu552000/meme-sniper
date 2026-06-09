@@ -292,8 +292,12 @@ def _execute_sell(mint, pos, current_price, pnl_pct, reason):
                 f"⚠️ Sell FAILED for {ticker} (attempt {attempt}/{MAX_SELL_ATTEMPTS})\n"
                 f"Error: {result['error']}\n"
                 f"PnL now: {pnl_pct*100:+.1f}%\n"
-                f"Will retry next cycle."
+                f"Retrying in 5s..."
             )
+            # Retry immediately — don't wait for next monitor cycle (could be 30-60s away)
+            import threading
+            threading.Timer(5.0, _execute_sell,
+                args=(mint, pos, current_price, pnl_pct, reason)).start()
 
 
 def get_open_positions_summary() -> str:
