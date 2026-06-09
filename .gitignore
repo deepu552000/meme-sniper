@@ -9,3 +9,6 @@ __pycache__/
 venv/
 *.pyc
 score_log_backup*.json
+*.json
+*.log
+*backup*
