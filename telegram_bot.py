@@ -150,9 +150,9 @@ def send_sell_result(mint: str, ticker: str, name: str, tx_result: dict,
     send(msg)
 
 
-def send_sell_failed_alert(mint: str, error: str):
+def send_sell_failed_alert(mint: str, error: str, pnl_pct: float = None):
     """
-    Fired by trader.on_sell_failed when all sell attempts are exhausted.
+    Fired by monitor after all sell attempts are exhausted.
     Looks up position info from monitor if available.
     """
     try:
@@ -164,58 +164,16 @@ def send_sell_failed_alert(mint: str, error: str):
         ticker = "???"
         name   = mint[:8] + "..."
 
+    pnl_str = f" | PnL: {pnl_pct*100:+.1f}%" if pnl_pct is not None else ""
+
     msg = (
         f"🚨 <b>SELL FAILED — ALL RETRIES EXHAUSTED</b>\n"
-        f"Token: {name} (${ticker})\n"
+        f"Token: {name} (${ticker}){pnl_str}\n"
         f"Mint: <code>{mint}</code>\n"
         f"Error: {error}\n\n"
         f"⚠️ <b>Position still open! Manual sell required.</b>\n"
         f"🔗 <a href='https://jup.ag/swap/SOL-{mint}'>Sell on Jupiter</a> | "
         f"<a href='https://dexscreener.com/solana/{mint}'>DexScreener</a>"
-    )
-    send(msg)
-
-
-def send_sell_result(mint: str, ticker: str, name: str, tx_result: dict,
-                     reason: str = "", pnl_pct: float = None):
-    pnl_str = f" | PnL: {pnl_pct:+.1f}%" if pnl_pct is not None else ""
-    if tx_result["success"]:
-        sol_recv = tx_result.get("sol_received", 0)
-        msg = (
-            "💸 <b>SOLD</b> " + name + " ($" + ticker + ")" + pnl_str + "\n"
-            + "Reason: " + reason + "\n"
-            + "SOL received: " + f"{sol_recv:.4f}" + "\n"
-            + "TX: <a href='https://solscan.io/tx/" + tx_result["tx"] + "'>View on Solscan</a>"
-        )
-    else:
-        msg = (
-            "🚨 <b>SELL FAILED</b> " + name + " ($" + ticker + ")" + pnl_str + "\n"
-            + "Reason tried: " + reason + "\n"
-            + "Error: " + tx_result["error"] + "\n"
-            + "⚠️ <b>Position still open — manual action may be needed!</b>\n"
-            + "🔗 <a href='https://dexscreener.com/solana/" + mint + "'>DexScreener</a> | "
-            + "<a href='https://jup.ag/swap/SOL-" + mint + "'>Jupiter</a>"
-        )
-    send(msg)
-
-
-def send_sell_failed_alert(mint: str, error: str):
-    try:
-        import monitor
-        pos    = monitor.positions.get(mint, {})
-        ticker = pos.get("ticker", "???")
-        name   = pos.get("name", mint[:8] + "...")
-    except Exception:
-        ticker = "???"
-        name   = mint[:8] + "..."
-    msg = (
-        "🚨 <b>SELL FAILED — ALL RETRIES EXHAUSTED</b>\n"
-        + "Token: " + name + " ($" + ticker + ")\n"
-        + "Mint: <code>" + mint + "</code>\n"
-        + "Error: " + error + "\n\n"
-        + "⚠️ <b>Position still open! Manual sell required.</b>\n"
-        + "🔗 <a href='https://jup.ag/swap/SOL-" + mint + "'>Sell on Jupiter</a> | "
-        + "<a href='https://dexscreener.com/solana/" + mint + "'>DexScreener</a>"
     )
     send(msg)
 
@@ -308,20 +266,28 @@ def _handle_command(text: str, bot_ref):
         import wallet as w
         import trader as t
         import hold_manager
+        import watchlist as wl
         sol = w.get_sol_balance()
         price = t.get_sol_price_usd()
         summary = monitor.get_open_positions_summary()
         long_hold_summary = hold_manager.get_long_hold_summary()
+        wl_summary = wl.get_watchlist_summary()
         reply(
             f"🤖 Bot is running\n"
             f"SOL Balance: {sol:.4f} (${sol*price:.2f})\n\n"
             f"{summary}\n\n"
-            f"{long_hold_summary}"
+            f"{long_hold_summary}\n\n"
+            f"{wl_summary}"
         )
 
     elif text == "/positions":
         import hold_manager
+        import watchlist as wl
         reply(monitor.get_open_positions_summary() + "\n\n" + hold_manager.get_long_hold_summary())
+
+    elif text == "/watchlist":
+        import watchlist as wl
+        reply(wl.get_watchlist_summary())
 
     elif text == "/pause":
         bot_ref["paused"] = True
@@ -373,6 +339,53 @@ def _handle_command(text: str, bot_ref):
         price = t.get_sol_price_usd()
         reply(f"💰 Balance: {sol:.4f} SOL (${sol*price:.2f})")
 
+    elif text.startswith("/wbuy"):
+        import watchlist as wl
+        import trader as t
+        parts = text.split()
+        if len(parts) < 2:
+            reply("Usage: /wbuy TICKER  (e.g. /wbuy JOTCHUA)")
+        else:
+            ticker = parts[1].upper().lstrip("$")
+            mint   = wl.find_mint_by_ticker(ticker)
+            if not mint:
+                reply(
+                    f"❌ ${ticker} not on watchlist.\n"
+                    f"Use /watchlist to see current watchlist."
+                )
+            else:
+                entry = wl.trigger_manual_buy(mint)
+                if not entry:
+                    reply(f"❌ Could not find ${ticker} on watchlist.")
+                else:
+                    reply(f"⏳ Manually buying watchlist coin ${ticker}...")
+                    tx_result = t.buy_token(mint)
+                    if tx_result["success"]:
+                        import wallet as w
+                        decimals     = t._get_token_decimals(mint)
+                        token_amount = tx_result["amount_out"] / (10 ** decimals)
+                        sol_price    = t.get_sol_price_usd()
+                        sol_spent    = config.BUY_AMOUNT_USD / sol_price
+                        entry_price  = (sol_spent / token_amount) * sol_price if token_amount > 0 else 0
+                        monitor.add_position(
+                            mint=mint,
+                            entry_price=entry_price,
+                            token_amount=token_amount,
+                            score=entry.get("last_score", 0),
+                            hold = True,
+                            name=entry["name"],
+                            ticker=entry["ticker"],
+                        )
+                        from scanner import mark_token_seen
+                        mark_token_seen(mint)
+                        wl.remove_from_watchlist(mint)
+                        reply(
+                            f"✅ Bought ${ticker} from watchlist!\n"
+                            f"TX: https://solscan.io/tx/{tx_result['tx']}"
+                        )
+                    else:
+                        reply(f"❌ Buy failed for ${ticker}: {tx_result['error']}")
+
     elif text.startswith("/holdsell"):
         import hold_manager
         parts = text.split()
@@ -390,16 +403,25 @@ def _handle_command(text: str, bot_ref):
                 reply(f"⏳ Selling long-hold position ${ticker}...")
                 hold_manager.manual_sell(mint)
 
+    elif text in ["/stats", "/stats7", "/stats30"]:
+        import trade_logger
+        days = 7 if text == "/stats7" else 30
+        reply(trade_logger.format_stats_message(days))
+
     elif text == "/help":
         reply(
             "📋 <b>Commands:</b>\n"
             "/status — bot status + all positions\n"
             "/positions — open + long-hold positions\n"
             "/balance — wallet balance\n"
+            "/stats — PnL stats last 30 days\n"
+            "/stats7 — PnL stats last 7 days\n"
             "/pause — stop new buys\n"
             "/resume — restart buying\n"
             "/sellall — emergency sell all active positions\n"
             "/holdsell TICKER — manually sell a long-hold position\n"
+            "/watchlist — show watchlist coins\n"
+            "/wbuy TICKER — manually buy a watchlist coin\n"
             "/clearmanual — remove manually-sold stuck positions\n"
             "/help — this message"
         )

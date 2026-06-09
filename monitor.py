@@ -8,6 +8,7 @@ import config
 import trader
 import telegram_bot as tg
 import hold_manager
+import trade_logger
 
 HEADERS = {"User-Agent": "Mozilla/5.0 MemeSniper/1.0"}
 
@@ -262,9 +263,11 @@ def _execute_sell(mint, pos, current_price, pnl_pct, reason):
 
         # PumpPortal returns sol_received=0 — calculate profit from PnL% instead
         if result["sol_received"] > 0:
-            profit_usd = (result["sol_received"] * sol_usd) - config.BUY_AMOUNT_USD
+            sell_usd   = result["sol_received"] * sol_usd
+            profit_usd = sell_usd - config.BUY_AMOUNT_USD
         else:
             profit_usd = config.BUY_AMOUNT_USD * pnl_pct
+            sell_usd   = config.BUY_AMOUNT_USD + profit_usd
 
         tg.send_sell_result(
             mint=mint,
@@ -273,6 +276,24 @@ def _execute_sell(mint, pos, current_price, pnl_pct, reason):
             tx_result=result,
             reason=f"{reason} | Entry: ${pos['entry_price']:.8f} → Exit: ${current_price:.8f} (${profit_usd:+.2f})",
             pnl_pct=pnl_pct * 100,
+        )
+
+        # Log completed trade
+        trade_logger.log_trade(
+            mint=mint,
+            name=name,
+            ticker=ticker,
+            score=pos.get("score", 0),
+            hold=pos.get("hold", False),
+            buy_time=pos["buy_time"],
+            sell_time=time.time(),
+            buy_usd=config.BUY_AMOUNT_USD,
+            sell_usd=sell_usd,
+            pnl_usd=profit_usd,
+            pnl_pct=pnl_pct * 100,
+            sell_reason=reason,
+            manual=False,
+            tx_sell=result.get("tx", ""),
         )
         remove_position(mint)
 
@@ -283,18 +304,34 @@ def _execute_sell(mint, pos, current_price, pnl_pct, reason):
         _save_positions()
 
         if attempt >= MAX_SELL_ATTEMPTS:
-            # Max attempts reached — mark manual, send final alert with links
+            # Max attempts reached — mark manual, send ONE final alert with links
             pos["manual"] = True
             _save_positions()
-            tg.send_sell_failed_alert(mint, result["error"])
-        else:
-            tg.send(
-                f"⚠️ Sell FAILED for {ticker} (attempt {attempt}/{MAX_SELL_ATTEMPTS})\n"
-                f"Error: {result['error']}\n"
-                f"PnL now: {pnl_pct*100:+.1f}%\n"
-                f"Retrying in 5s..."
+            tg.send_sell_failed_alert(mint, result["error"], pnl_pct=pnl_pct)
+
+            # Log as manual trade — PnL is estimated at the time bot gave up
+            # Actual sell price on Jupiter may differ; marked manual=True so stats show separately
+            est_sell_usd   = config.BUY_AMOUNT_USD + (config.BUY_AMOUNT_USD * pnl_pct)
+            est_profit_usd = config.BUY_AMOUNT_USD * pnl_pct
+            trade_logger.log_trade(
+                mint=mint,
+                name=name,
+                ticker=ticker,
+                score=pos.get("score", 0),
+                hold=pos.get("hold", False),
+                buy_time=pos["buy_time"],
+                sell_time=time.time(),
+                buy_usd=config.BUY_AMOUNT_USD,
+                sell_usd=est_sell_usd,
+                pnl_usd=est_profit_usd,
+                pnl_pct=pnl_pct * 100,
+                sell_reason=f"MANUAL (bot failed) — {reason}",
+                manual=True,
+                tx_sell="",
             )
-            # Retry immediately — don't wait for next monitor cycle (could be 30-60s away)
+        else:
+            # Retry silently — no per-attempt Telegram noise
+            print(f"[monitor] Sell attempt {attempt}/{MAX_SELL_ATTEMPTS} failed for {ticker}, retrying in 5s...")
             import threading
             threading.Timer(5.0, _execute_sell,
                 args=(mint, pos, current_price, pnl_pct, reason)).start()

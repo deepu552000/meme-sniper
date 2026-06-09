@@ -68,7 +68,7 @@ PENDING_FILE        = "pending_mints.json"
 _pending: dict      = {}
 _pending_lock       = threading.Lock()
 PENDING_RECHECK_SEC = 600   # 10 minutes
-PENDING_EXPIRE_SEC  = 1800  # drop after 30 mins if still no liquidity
+PENDING_EXPIRE_SEC  = 5400  # drop after 90 mins if still no liquidity
 
 def _load_pending():
     global _pending

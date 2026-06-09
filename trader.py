@@ -135,16 +135,9 @@ def sell_token(mint: str, amount: float | None = None) -> dict:
         print(f"[trader] PumpPortal failed ({result['error']}) — falling back to Jupiter...")
         result = _sell_jupiter(mint, jupiter_amount)
 
-        if not result["success"]:
-            _fire_sell_failed(mint, result["error"])
-
         return result
 
     result = _sell_jupiter(mint, amount)
-
-    if not result["success"]:
-        _fire_sell_failed(mint, result["error"])
-
     return result
 
 

@@ -193,13 +193,24 @@ def score_token(token: dict) -> dict:
     if not freeze_auth:
         return _reject("Freeze authority NOT revoked — rug risk")
     # Dev-aware top holder check: stricter if top holder is the creator
+    #
+    # Dev  > 15% and is top holder → hard blacklist (dev rug risk)
+    # Whale > 40%                   → hard blacklist (genuine concentration risk)
+    # Whale 25–40%                  → requeue: may be accumulating early,
+    #                                  score + top10 penalty gates the buy naturally.
+    #                                  Covers Jotchua case: 25.1% whale snapshot
+    #                                  caused permanent blacklist on a 4.7m coin.
+    # dev_pct fallback > 15%        → requeue (RugCheck data missing, don't
+    #                                  permanently blacklist on incomplete data)
     if top_holder_pct is not None:
-        if is_dev_top_holder and top_holder_pct > 10:
-            return _reject(f"Dev holds {top_holder_pct:.1f}% — too centralised (dev limit: 10%)")
+        if is_dev_top_holder and top_holder_pct > 15:
+            return _reject(f"Dev holds {top_holder_pct:.1f}% — too centralised (dev limit: 15%)")
+        elif not is_dev_top_holder and top_holder_pct > 40:
+            return _reject(f"Single whale holds {top_holder_pct:.1f}% — rug risk (whale limit: 40%)")
         elif not is_dev_top_holder and top_holder_pct > 25:
-            return _reject(f"Single whale holds {top_holder_pct:.1f}% — rug risk (whale limit: 25%)")
-    elif dev_pct is not None and dev_pct > 10:
-        return _reject(f"Top holder {dev_pct:.1f}% exceeds safe limit")
+            return _reject(f"Whale holds {top_holder_pct:.1f}% — watching (requeue)", requeue=True)
+    elif dev_pct is not None and dev_pct > 15:
+        return _reject(f"Top holder {dev_pct:.1f}% exceeds safe limit — requeuing", requeue=True)
     if liquidity < 400 and volume_5m < 200 and volume_1h < 300:
         return _reject(f"Liquidity too low (${liquidity:,.0f})")
     if holders < 5 and volume_5m < 50 and volume_1h < 200:
@@ -444,13 +455,14 @@ def score_token(token: dict) -> dict:
     }
 
 
-def _reject(reason: str) -> dict:
+def _reject(reason: str, requeue: bool = False) -> dict:
     return {
         "score": 0,
         "buy": False,
         "hold": False,
         "breakdown": {},
         "reject_reason": reason,
+        "requeue": requeue,   # True = requeue for next cycle, False = permanent blacklist
         "twitter_data": {},
         "website_data": {},
     }

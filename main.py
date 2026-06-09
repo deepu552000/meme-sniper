@@ -10,6 +10,7 @@ import scorer
 import trader
 import monitor
 import hold_manager
+import watchlist as wl
 import telegram_bot as tg
 import wallet as w
 
@@ -81,6 +82,7 @@ def main():
     last_monitor_time       = 0
     last_fast_monitor_time  = 0   # Fix 1: fast-poll young positions
     last_long_hold_time     = 0   # Long-hold tier: check every 5 min
+    last_watchlist_time     = 0   # Watchlist: check every 30 min
     last_heartbeat_time     = time.time()
     HEARTBEAT_INTERVAL      = 6 * 3600   # 6 hours
     FAST_MONITOR_INTERVAL   = 5          # Fix 1: check young positions every 5s
@@ -106,6 +108,44 @@ def main():
             if time.time() - last_long_hold_time >= hold_manager.LONG_HOLD_MONITOR_SEC:
                 hold_manager.check_long_holds()
                 last_long_hold_time = time.time()
+
+            # ── Watchlist check (every 30 min) ───────────────────────────────
+            if time.time() - last_watchlist_time >= wl.WATCHLIST_CHECK_SEC:
+                if not bot_state["paused"] and len(monitor.positions) < config.MAX_POSITIONS:
+                    mints_to_buy = wl.check_watchlist(bot_state)
+                    for mint in mints_to_buy:
+                        if len(monitor.positions) >= config.MAX_POSITIONS:
+                            break
+                        entry = wl.watchlist.get(mint)
+                        if not entry:
+                            continue
+                        sol_bal   = w.get_sol_balance()
+                        sol_price = trader.get_sol_price_usd()
+                        if sol_bal * sol_price < config.BUY_AMOUNT_USD:
+                            tg.send("⚠️ Insufficient SOL balance — skipping watchlist buy")
+                            break
+                        tx_result = trader.buy_token(mint)
+                        if tx_result["success"]:
+                            from scanner import mark_token_seen
+                            mark_token_seen(mint)
+                            decimals     = trader._get_token_decimals(mint)
+                            token_amount = tx_result["amount_out"] / (10 ** decimals)
+                            sol_price_now = trader.get_sol_price_usd()
+                            sol_spent    = config.BUY_AMOUNT_USD / sol_price_now
+                            entry_price  = (sol_spent / token_amount) * sol_price_now if token_amount > 0 else 0
+                            monitor.add_position(
+                                mint=mint,
+                                entry_price=entry_price,
+                                token_amount=token_amount,
+                                score=entry.get("last_score", 0),
+                                hold = True,
+                                name=entry["name"],
+                                ticker=entry["ticker"],
+                            )
+                            wl.remove_from_watchlist(mint)
+                        else:
+                            tg.send(f"❌ Watchlist buy failed for ${entry['ticker']}: {tx_result['error']}")
+                last_watchlist_time = time.time()
 
             # ── Scan for new coins ────────────────────────────────────
             if not bot_state["paused"]:
@@ -137,11 +177,14 @@ def main():
                         if result["reject_reason"]:
                             _save_score_log(token, result, 0)
 
-                            # If rejected only due to holders/volume — requeue in pending for recheck
-                            if any(
+                            # result["requeue"]=True  → scorer flagged this for recheck
+                            #   (whale 25-40%, missing RugCheck data, holders/volume too low)
+                            # result["requeue"]=False → permanent blacklist
+                            should_requeue = result.get("requeue", False) or any(
                                 kw in result["reject_reason"].lower()
                                 for kw in ("holders", "volume", "token too new")
-                            ):
+                            )
+                            if should_requeue:
                                 from scanner import _add_pending
                                 _add_pending(token)
                                 print(f"REJECTED (requeued) — {result['reject_reason']}")
@@ -172,11 +215,12 @@ def main():
                             tg.send_scan_found(token, result)
 
                         # If score is close but not there yet — requeue for recheck
-                        # This handles coins improving over time (holders/volume growing)
+                        # AND add to watchlist for long-term monitoring
                         if not result["buy"] and score >= 25 and token.get("age_minutes", 999) < 60:
                             from scanner import _add_pending
                             _add_pending(token)
-                            print(f"  score={score} (below threshold, requeued for recheck)")
+                            wl.add_to_watchlist(token, score)
+                            print(f"  score={score} (below threshold, requeued + watchlisted)")
                             continue
 
                         # Too low score and not worth rechecking — blacklist
