@@ -109,7 +109,7 @@ def main():
                 hold_manager.check_long_holds()
                 last_long_hold_time = time.time()
 
-            # ── Watchlist check (every 30 min) ───────────────────────────────
+            # ── Watchlist check (every 5 min) ────────────────────────────────
             if time.time() - last_watchlist_time >= wl.WATCHLIST_CHECK_SEC:
                 if not bot_state["paused"] and len(monitor.positions) < config.MAX_POSITIONS:
                     mints_to_buy = wl.check_watchlist(bot_state)
@@ -131,18 +131,30 @@ def main():
                             decimals     = trader._get_token_decimals(mint)
                             token_amount = tx_result["amount_out"] / (10 ** decimals)
                             sol_price_now = trader.get_sol_price_usd()
-                            sol_spent    = config.BUY_AMOUNT_USD / sol_price_now
+                            # Use actual lamports spent if available (more accurate)
+                            if tx_result.get("sol_spent_lamports"):
+                                sol_spent = tx_result["sol_spent_lamports"] / 1_000_000_000
+                            else:
+                                sol_spent = config.BUY_AMOUNT_USD / sol_price_now
                             entry_price  = (sol_spent / token_amount) * sol_price_now if token_amount > 0 else 0
                             monitor.add_position(
                                 mint=mint,
                                 entry_price=entry_price,
                                 token_amount=token_amount,
                                 score=entry.get("last_score", 0),
-                                hold = True,
+                                hold=True,
                                 name=entry["name"],
                                 ticker=entry["ticker"],
                             )
                             wl.remove_from_watchlist(mint)
+                            # Send buy confirmation with Solscan link like normal buys
+                            tg.send(
+                                f"✅ <b>WATCHLIST BUY CONFIRMED</b>\n"
+                                f"Token: {entry['name']} (${entry['ticker']})\n"
+                                f"Entry: ${entry_price:.8f}\n"
+                                f"Mode: HOLD 🫂 (watchlist buy)\n"
+                                f"TX: <a href='https://solscan.io/tx/{tx_result['tx']}'>View on Solscan</a>"
+                            )
                         else:
                             tg.send(f"❌ Watchlist buy failed for ${entry['ticker']}: {tx_result['error']}")
                 last_watchlist_time = time.time()
@@ -254,7 +266,11 @@ def main():
                                 decimals = trader._get_token_decimals(mint)
                                 token_amount = tx_result["amount_out"] / (10 ** decimals)
                                 sol_price_now = trader.get_sol_price_usd()
-                                sol_spent = config.BUY_AMOUNT_USD / sol_price_now
+                                # Use actual lamports spent if available (more accurate than BUY_AMOUNT_USD)
+                                if tx_result.get("sol_spent_lamports"):
+                                    sol_spent = tx_result["sol_spent_lamports"] / 1_000_000_000
+                                else:
+                                    sol_spent = config.BUY_AMOUNT_USD / sol_price_now
                                 entry_price = (sol_spent / token_amount) * sol_price_now if token_amount > 0 else 0
 
                                 # Fallback to DexScreener if calculation failed

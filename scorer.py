@@ -215,8 +215,14 @@ def score_token(token: dict) -> dict:
         return _reject(f"Liquidity too low (${liquidity:,.0f})")
     if holders < 5 and volume_5m < 50 and volume_1h < 200:
         return _reject(f"Only {holders} holders — too early/fake")
-    if top10_pct is not None and top10_pct > 80:
+    if top10_pct is not None and top10_pct > 70:
         return _reject(f"Top 10 wallets hold {top10_pct:.0f}% — centralised")
+
+    # Combo reject — dev whale + concentrated top10 = almost always rug
+    # e.g. AESOP: dev 20.7% + top10 62% → dumped immediately
+    if dev_pct is not None and top10_pct is not None:
+        if dev_pct > 15 and top10_pct > 55:
+            return _reject(f"Dev {dev_pct:.0f}% + top10 {top10_pct:.0f}% — whale concentration rug risk")
 
     # Heavy selling pressure (65%+ sells with meaningful activity)
     total_txns = buy_txns + sell_txns

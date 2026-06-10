@@ -37,7 +37,7 @@ HEADERS = {"User-Agent": "Mozilla/5.0 MemeSniper/1.0"}
 WATCHLIST_FILE = "watchlist.json"
 
 # Monitoring interval — called from main.py
-WATCHLIST_CHECK_SEC = 1800      # check every 30 minutes
+WATCHLIST_CHECK_SEC = 300       # check every 5 minutes
 
 # Thresholds
 ORG_SCORE_ALERT     = 30        # send alert when org score crosses this
@@ -225,6 +225,12 @@ def check_watchlist(bot_state: dict) -> list[str]:
             # ── Re-score the coin ────────────────────────────────────
             new_score = _quick_rescore(mint, entry, current_liq, current_holders, org_score, age_minutes)
 
+            # ── Already pumped too much — alert only, no auto-buy ────
+            # If coin is already up 300%+ in 1h or 500%+ in 24h it's too late to enter safely
+            price_change_1h  = dex.get("price_change_1h", 0)
+            price_change_24h = dex.get("price_change_24h", 0)
+            already_pumped   = price_change_1h > 300 or price_change_24h > 500
+
             # ── Alert conditions ─────────────────────────────────────
 
             # Holder growth alert
@@ -245,7 +251,7 @@ def check_watchlist(bot_state: dict) -> list[str]:
                 # Check holder growth is also positive
                 holders_growing = current_holders > entry["initial_holders"] * 1.20
 
-                if holders_growing and not bot_state.get("paused"):
+                if holders_growing and not bot_state.get("paused") and not already_pumped:
                     print(f"[watchlist] AUTO-BUY triggered: {entry['ticker']} org={org_score:.0f} holders +{holder_growth*100:.0f}%")
                     to_buy.append(mint)
                     entry["buy_triggered"] = True
@@ -253,23 +259,55 @@ def check_watchlist(bot_state: dict) -> list[str]:
                                           current_holders, current_liq, holder_growth,
                                           f"🚀 AUTO-BUY: Org score {org_score:.0f} + holders growing +{holder_growth*100:.0f}%")
                 else:
+                    reason_str = f"⚡ Org score {org_score:.0f}"
+                    if already_pumped:
+                        reason_str += f" — already pumped {price_change_1h:.0f}% 1h / {price_change_24h:.0f}% 24h — manual entry only"
+                    else:
+                        reason_str += f" — use /wbuy {entry['ticker']} to buy"
                     _send_watchlist_alert(mint, entry, new_score, org_score,
                                           current_holders, current_liq, holder_growth,
-                                          f"⚡ Org score {org_score:.0f} — use /wbuy {entry['ticker']} to buy")
+                                          reason_str)
 
-            # Score naturally improved to 40+ — auto-buy
+            # Score naturally improved to 40+ — auto-buy ONLY if safe conditions met
             if new_score >= config.MIN_SCORE_TO_BUY and not entry.get("buy_triggered") and not bot_state.get("paused"):
-                print(f"[watchlist] AUTO-BUY triggered: {entry['ticker']} score reached {new_score}")
-                to_buy.append(mint)
-                entry["buy_triggered"] = True
-                tg.send(
-                    f"✅ <b>Watchlist score reached {new_score}!</b>\n"
-                    f"Token: {entry['name']} (${entry['ticker']})\n"
-                    f"Was: {entry['initial_score']} → Now: {new_score}\n"
-                    f"Org score: {org_score or 'N/A'}\n"
-                    f"Holders: {current_holders:,} (+{holder_growth*100:.0f}%)\n"
-                    f"Auto-buying now... 🤖"
-                )
+                # Safety checks — don't buy if holders data is bad or org score is suspicious
+                holders_valid   = current_holders > 0 and current_holders >= entry["initial_holders"] * 1.07
+                holders_initial = entry.get("initial_holders", 0)
+
+                # Org score logic based on how long we've been watching:
+                # - Under 1h: None is ok (too young for Jupiter to score)
+                # - Over 1h: None is suspicious (Jupiter should have scored by now)
+                # - 0: always block (confirmed inorganic)
+                # - 20+: allow (some organic activity confirmed)
+                age_hours_watched = (now - entry["added_time"]) / 3600
+                if org_score is None:
+                    org_ok = age_hours_watched < 1.0   # None only ok under 1h
+                elif org_score == 0:
+                    org_ok = False                      # confirmed inorganic
+                else:
+                    org_ok = org_score >= 20            # some organic activity
+
+                if holders_valid and org_ok and holders_initial > 0 and not already_pumped:
+                    print(f"[watchlist] AUTO-BUY triggered: {entry['ticker']} score reached {new_score}")
+                    to_buy.append(mint)
+                    entry["buy_triggered"] = True
+                    tg.send(
+                        f"✅ <b>Watchlist score reached {new_score}!</b>\n"
+                        f"Token: {entry['name']} (${entry['ticker']})\n"
+                        f"Was: {entry['initial_score']} → Now: {new_score}\n"
+                        f"Org score: {org_score if org_score is not None else 'N/A'}\n"
+                        f"Holders: {current_holders:,} (+{holder_growth*100:.0f}%)\n"
+                        f"Auto-buying now... 🤖"
+                    )
+                else:
+                    # Not safe to auto-buy — alert instead
+                    print(f"[watchlist] Score {new_score} but unsafe to auto-buy (holders={current_holders} org={org_score}) — alerting only")
+                    tg.send(
+                        f"⚠️ <b>Watchlist score {new_score} but skipping auto-buy</b>\n"
+                        f"Token: {entry['name']} (${entry['ticker']})\n"
+                        f"Org score: {org_score if org_score is not None else 'N/A'} | Holders: {current_holders:,}\n"
+                        f"Use /wbuy {entry['ticker']} to buy manually if you want."
+                    )
 
             # Update entry
             entry["last_check_time"] = now
@@ -363,7 +401,7 @@ def _quick_rescore(mint, entry, liq, holders, org_score, age_minutes) -> int:
     return min(score, 100)
 
 
-# ─── DexScreener fetcher ──────────────────────────────────────────────────────
+# ─── DexScreener + RugCheck fetcher ─────────────────────────────────────────
 
 def _get_dexscreener(mint: str) -> dict | None:
     try:
@@ -377,15 +415,62 @@ def _get_dexscreener(mint: str) -> dict | None:
         if not pairs:
             return None
         best = max(pairs, key=lambda p: float(p.get("liquidity", {}).get("usd", 0) or 0))
-        info = best.get("info", {})
+
+        # Try holders from pairs data first, then info block
+        holders = int(best.get("holders", 0) or 0)
+        if holders == 0:
+            info = best.get("info", {})
+            holders = int(info.get("holders", 0) or 0)
+
+        # If still 0 — use RugCheck like scanner does (most reliable source)
+        if holders == 0:
+            holders = _get_rugcheck_holders(mint)
+
+        pc = best.get("priceChange", {})
         return {
-            "price_usd":     float(best.get("priceUsd", 0) or 0),
-            "liquidity_usd": float(best.get("liquidity", {}).get("usd", 0) or 0),
-            "holders":       int(best.get("holders", 0) or 0),
-            "fdv":           float(best.get("fdv", 0) or 0),
+            "price_usd":      float(best.get("priceUsd", 0) or 0),
+            "liquidity_usd":  float(best.get("liquidity", {}).get("usd", 0) or 0),
+            "holders":        holders,
+            "fdv":            float(best.get("fdv", 0) or 0),
+            "price_change_1h": float(pc.get("h1", 0) or 0),
+            "price_change_6h": float(pc.get("h6", 0) or 0),
+            "price_change_24h": float(pc.get("h24", 0) or 0),
         }
     except Exception:
         return None
+
+
+def _get_rugcheck_holders(mint: str) -> int:
+    """Fetch holder count from RugCheck — same source as scanner/scorer."""
+    try:
+        # Try v1 summary endpoint first
+        r = requests.get(
+            f"{config.RUGCHECK_URL}/tokens/{mint}/report/summary",
+            headers=HEADERS,
+            timeout=6
+        )
+        if r.status_code == 200:
+            data = r.json()
+            top_h = data.get("topHolders") or []
+            holders = data.get("totalHolders", len(top_h) if top_h else 0)
+            if holders and holders > 0:
+                return int(holders)
+
+        # Fallback to full report
+        r2 = requests.get(
+            f"{config.RUGCHECK_URL}/tokens/{mint}/report",
+            headers=HEADERS,
+            timeout=6
+        )
+        if r2.status_code == 200:
+            data2 = r2.json()
+            top_h2 = data2.get("topHolders") or []
+            holders2 = data2.get("totalHolders", len(top_h2) if top_h2 else 0)
+            if holders2 and holders2 > 0:
+                return int(holders2)
+    except Exception:
+        pass
+    return 0
 
 
 # ─── Org score fetcher ────────────────────────────────────────────────────────

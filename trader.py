@@ -101,8 +101,27 @@ def buy_token(mint: str, usd_amount: float = None) -> dict:
         if not tx_hash:
             return {"success": False, "tx": "", "amount_out": 0, "error": "TX send failed after retry"}
 
+    # Use quote outAmount as initial estimate
     amount_out = int(quote.get("outAmount", 0))
-    return {"success": True, "tx": tx_hash, "amount_out": amount_out, "error": ""}
+
+    # Fetch actual on-chain token balance after confirmation for accurate entry price
+    # This is more reliable than quote outAmount which may differ due to slippage
+    try:
+        import time as _t
+        _t.sleep(2)  # wait for RPC to catch up
+        actual_balance = w.get_token_balance(mint)
+        if actual_balance > 0:
+            # Convert to raw units using decimals
+            decimals = _get_token_decimals(mint)
+            actual_raw = int(actual_balance * (10 ** decimals))
+            if actual_raw > 0:
+                amount_out = actual_raw
+                print(f"[trader] Actual tokens received: {actual_balance:.4f} (raw: {actual_raw})")
+    except Exception as e:
+        print(f"[trader] Could not fetch actual balance: {e} — using quote estimate")
+
+    # Also return lamports spent for accurate entry price calculation
+    return {"success": True, "tx": tx_hash, "amount_out": amount_out, "sol_spent_lamports": lamports, "error": ""}
 
 
 def sell_token(mint: str, amount: float | None = None) -> dict:
@@ -135,9 +154,16 @@ def sell_token(mint: str, amount: float | None = None) -> dict:
         print(f"[trader] PumpPortal failed ({result['error']}) — falling back to Jupiter...")
         result = _sell_jupiter(mint, jupiter_amount)
 
+        if not result["success"]:
+            _fire_sell_failed(mint, result["error"])
+
         return result
 
     result = _sell_jupiter(mint, amount)
+
+    if not result["success"]:
+        _fire_sell_failed(mint, result["error"])
+
     return result
 
 
